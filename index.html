@@ -469,12 +469,39 @@
   <section id="tab-settings" style="display:none;">
     <div class="card">
       <div class="settings-line">
-        <label>Printer Paper Width</label>
+        <label>🖨️ Thermal Printer</label>
         <div class="radio-group">
           <label><input type="radio" name="paper" value="80" checked onchange="setPaper('80')"> 80mm (standard)</label>
           <label><input type="radio" name="paper" value="58" onchange="setPaper('58')"> 58mm (small)</label>
         </div>
-        <div class="hint">Choose the size that matches your thermal printer roll. When you click Print, select your thermal printer in the print dialog and set paper size to match.</div>
+        <button class="btn btn-outline" onclick="testPrint()" style="margin-top:10px;">🖨️ Test Print</button>
+        <div class="hint">Use Test Print to confirm your printer is set up correctly before relying on it for real bills.</div>
+
+        <div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--line);">
+          <label>Bluetooth Printer Connection</label>
+          <div class="hint" style="margin:6px 0 10px;">
+            <b>Recommended method (works with almost all thermal printers):</b><br>
+            1. Install "<b>RawBT - print service</b>" from Play Store (free)<br>
+            2. Pair your printer in phone Bluetooth settings<br>
+            3. Open RawBT, select your printer, set as default<br>
+            4. When you tap "Print Bill", choose <b>RawBT</b> in the print dialog
+          </div>
+
+          <label>Printer Bluetooth Name (optional)</label>
+          <input id="bleNameFilter" placeholder="e.g. Printer001" oninput="saveBleNameFilter()" style="margin-bottom:10px;">
+          <div class="hint" style="margin-bottom:10px;">If you know your printer's Bluetooth name, enter it here — the picker below will show only that device, so there's no need to search through a long list each time.</div>
+
+          <button class="btn btn-outline" onclick="connectBluetoothPrinter()">🔵 Try Direct Bluetooth Connect (Experimental)</button>
+          <div id="blePrinterStatus" class="hint" style="margin-top:6px;">Not connected.</div>
+          <div id="bleAutoReconnectNote" class="hint" style="margin-top:4px;"></div>
+          <div id="bleDirectPrintRow" style="display:none; margin-top:10px;">
+            <label style="display:flex; align-items:center; gap:8px; font-weight:500; font-size:16px;">
+              <input type="checkbox" id="bleDirectPrintToggle" style="width:auto;" onchange="setBleDirectPrintEnabled(this.checked)">
+              Use this Bluetooth printer directly (skip system print dialog)
+            </label>
+          </div>
+          <div class="hint" style="margin-top:8px;">This direct option only works with printers that support Bluetooth <b>Low Energy</b>. Most low-cost thermal printers use Classic Bluetooth and need the RawBT method above instead — if direct connect fails, that's expected, just use RawBT.</div>
+        </div>
       </div>
     </div>
 
@@ -3005,8 +3032,12 @@ const LS_PAPER = 'nfs_paperWidth';
 const LS_UPI_ENABLED = 'nfs_upiEnabled';
 const LS_UPI_ID = 'nfs_upiId';
 const LS_UPI_NAME = 'nfs_upiName';
+const LS_BLE_DIRECT = 'nfs_bleDirectPrint';
+const LS_BLE_NAME_FILTER = 'nfs_bleNameFilter';
 let editingBillId = null;
 let lastSavedBillId = null;
+let bleDevice = null;
+let bleCharacteristic = null;
 
 function getBills(){ return JSON.parse(localStorage.getItem(LS_BILLS) || '[]'); }
 function saveBills(arr){ localStorage.setItem(LS_BILLS, JSON.stringify(arr)); }
@@ -3021,6 +3052,10 @@ function setPaperStorage(v){ localStorage.setItem(LS_PAPER, v); }
 function getUpiEnabled(){ const v = localStorage.getItem(LS_UPI_ENABLED); return v === null ? true : v === '1'; }
 function getUpiId(){ return localStorage.getItem(LS_UPI_ID) || 'paytmqr5ftk5t@ptys'; }
 function getUpiName(){ return localStorage.getItem(LS_UPI_NAME) || 'Sri Balaji Fancy Store'; }
+function getBleDirectPrintEnabled(){ return localStorage.getItem(LS_BLE_DIRECT) === '1'; }
+function setBleDirectPrintEnabled(v){ localStorage.setItem(LS_BLE_DIRECT, v ? '1' : '0'); }
+function getBleNameFilter(){ return localStorage.getItem(LS_BLE_NAME_FILTER) || ''; }
+function saveBleNameFilter(){ localStorage.setItem(LS_BLE_NAME_FILTER, document.getElementById('bleNameFilter').value.trim()); }
 
 function todayStr(){
   const d = new Date();
@@ -3763,7 +3798,221 @@ function generateUpiQrDataUrl(amount, billNo){
   });
 }
 
+/* ---------------- Bluetooth thermal printer (experimental, BLE only) ---------------- */
+const BLE_PRINTER_PROFILES = [
+  { service: '49535343-fe7d-4ae5-8fa9-9fafd205e455', characteristic: '49535343-8841-43f4-a8d4-ecbe34729bb3' },
+  { service: '0000ffe0-0000-1000-8000-00805f9b34fb', characteristic: '0000ffe1-0000-1000-8000-00805f9b34fb' }
+];
+const LS_BLE_DEVICE_ID = 'nfs_bleDeviceId';
+
+function updateBleStatusUI(){
+  const statusEl = document.getElementById('blePrinterStatus');
+  const rowEl = document.getElementById('bleDirectPrintRow');
+  if(!statusEl) return;
+  if(bleCharacteristic && bleDevice){
+    statusEl.textContent = '✅ Connected: ' + (bleDevice.name || 'Bluetooth printer');
+    if(rowEl) rowEl.style.display = '';
+  } else {
+    statusEl.textContent = 'Not connected.';
+  }
+}
+
+async function bindCharacteristicFromServer(server){
+  for(const profile of BLE_PRINTER_PROFILES){
+    try{
+      const service = await server.getPrimaryService(profile.service);
+      const characteristic = await service.getCharacteristic(profile.characteristic);
+      bleCharacteristic = characteristic;
+      return true;
+    }catch(e){ /* try next known profile */ }
+  }
+  return false;
+}
+
+function onBleDisconnected(){
+  bleCharacteristic = null;
+  updateBleStatusUI();
+  // try a silent reconnect in case it was just a brief signal drop
+  setTimeout(attemptAutoReconnectBle, 1500);
+}
+
+async function attemptAutoReconnectBle(){
+  if(!navigator.bluetooth || !navigator.bluetooth.getDevices) return false;
+  const storedId = localStorage.getItem(LS_BLE_DEVICE_ID);
+  if(!storedId) return false;
+  try{
+    const devices = await navigator.bluetooth.getDevices();
+    const device = devices.find(d => d.id === storedId);
+    if(!device) return false;
+    const server = await device.gatt.connect();
+    const ok = await bindCharacteristicFromServer(server);
+    if(ok){
+      bleDevice = device;
+      device.addEventListener('gattserverdisconnected', onBleDisconnected);
+      updateBleStatusUI();
+      toast('🖨️ Bluetooth printer reconnected automatically.');
+      return true;
+    }
+  }catch(e){ /* printer off / out of range — fine, will retry before next print */ }
+  return false;
+}
+
+async function connectBluetoothPrinter(){
+  if(!navigator.bluetooth){
+    toast('Bluetooth is not available in this browser/app. Please use the RawBT method instead.');
+    return false;
+  }
+  try{
+    const nameFilter = getBleNameFilter();
+    const requestOptions = nameFilter
+      ? { filters: [{ namePrefix: nameFilter }], optionalServices: BLE_PRINTER_PROFILES.map(p => p.service) }
+      : { acceptAllDevices: true, optionalServices: BLE_PRINTER_PROFILES.map(p => p.service) };
+    const device = await navigator.bluetooth.requestDevice(requestOptions);
+    toast('Connecting to ' + device.name + ' ...');
+    const server = await device.gatt.connect();
+    const connected = await bindCharacteristicFromServer(server);
+    const statusEl = document.getElementById('blePrinterStatus');
+    if(connected){
+      bleDevice = device;
+      localStorage.setItem(LS_BLE_DEVICE_ID, device.id);
+      device.addEventListener('gattserverdisconnected', onBleDisconnected);
+      statusEl.textContent = '✅ Connected: ' + (device.name || 'Bluetooth printer');
+      document.getElementById('bleDirectPrintRow').style.display = '';
+      toast('Connected! Try "Test Print" now to confirm it actually prints. Next time you open the app, it will try to reconnect automatically.');
+      return true;
+    } else {
+      statusEl.textContent = '⚠️ Connected to "' + (device.name || 'device') + '" but it doesn\'t look like a supported BLE printer.';
+      toast('This printer likely uses Classic Bluetooth, not BLE — please use the RawBT method instead.');
+      return false;
+    }
+  }catch(e){
+    toast('Could not connect: ' + (e.message || 'cancelled.'));
+    return false;
+  }
+}
+
+function escposQrBytes(data, moduleSize, errorLevel){
+  const bytes = [];
+  function push(...arr){ bytes.push(...arr); }
+  function pushStr(str){ for(let i=0;i<str.length;i++) bytes.push(str.charCodeAt(i) & 0xFF); }
+
+  push(0x1D,0x28,0x6B,0x04,0x00,0x31,0x41,0x32,0x00);          // select model 2
+  push(0x1D,0x28,0x6B,0x03,0x00,0x31,0x43, moduleSize);        // module size
+  push(0x1D,0x28,0x6B,0x03,0x00,0x31,0x45, errorLevel);        // error correction level
+  const dataLen = data.length + 3;
+  push(0x1D,0x28,0x6B, dataLen & 0xFF, (dataLen >> 8) & 0xFF, 0x31,0x50,0x30); // store data
+  pushStr(data);
+  push(0x1D,0x28,0x6B,0x03,0x00,0x31,0x51,0x30);               // print stored QR
+  return bytes;
+}
+
+function escposBytesForBill(bill){
+  const ESC = 0x1B, GS = 0x1D;
+  const bytes = [];
+  function pushText(str){ for(let i=0;i<str.length;i++) bytes.push(str.charCodeAt(i) & 0xFF); }
+  function cmd(...arr){ bytes.push(...arr); }
+
+  cmd(ESC, 0x40);          // initialize
+  cmd(ESC, 0x45, 0x01);    // bold ON for the whole receipt — prints darker on thermal paper
+  cmd(ESC, 0x61, 0x01);    // center align
+  pushText('New Fancy Store\n');
+  pushText('49, Kothapallimitta, S.R.Puram (Md)\n');
+  pushText('Chittoor - 517167\n');
+  pushText('Ph: 9866086614\n');
+  pushText('--------------------------------\n');
+  cmd(ESC, 0x61, 0x00);    // left align
+  pushText('Bill No: #'+String(bill.billNo).padStart(4,'0')+'   '+bill.dateDisplay+'\n');
+  pushText('Customer: '+bill.customer+'\n');
+  pushText('--------------------------------\n');
+  bill.items.forEach(it=>{
+    pushText(it.name+'\n');
+    pushText('  '+it.qty+' x Rs.'+it.price.toFixed(2)+' = Rs.'+it.amount.toFixed(2)+'\n');
+  });
+  pushText('--------------------------------\n');
+  pushText('TOTAL: Rs.'+bill.total.toFixed(2)+'\n');
+  if(bill.remarks){
+    pushText('Remarks: '+bill.remarks+'\n');
+  }
+  pushText('--------------------------------\n');
+
+  if(getUpiEnabled() && getUpiId().trim()){
+    cmd(ESC, 0x61, 0x01); // center
+    pushText('Scan & Pay Rs.'+bill.total.toFixed(2)+'\n');
+    const qrUri = buildUpiUri(bill.total, bill.billNo);
+    cmd(...escposQrBytes(qrUri, 5, 0x31));
+    pushText('\nUPI: '+getUpiId()+'\n');
+    pushText('--------------------------------\n');
+  }
+
+  cmd(ESC, 0x61, 0x01);
+  pushText('Thank You! Visit Again!\n');
+  cmd(ESC, 0x45, 0x00);   // bold off (tidy, in case printer keeps state across jobs)
+  pushText('\n\n\n\n\n\n'); // generous feed so the cutter doesn't slice through the last line
+  cmd(GS, 0x56, 0x00);     // cut, ignored harmlessly if unsupported
+  return new Uint8Array(bytes);
+}
+
+async function bleWriteChunk(chunk){
+  // Many cheap BLE printer modules only support "write without response".
+  // Plain writeValue() can silently throw on those, so try the most likely method first.
+  if(typeof bleCharacteristic.writeValueWithoutResponse === 'function'){
+    try{ await bleCharacteristic.writeValueWithoutResponse(chunk); return; }catch(e){ /* fall through */ }
+  }
+  if(typeof bleCharacteristic.writeValueWithResponse === 'function'){
+    try{ await bleCharacteristic.writeValueWithResponse(chunk); return; }catch(e){ /* fall through */ }
+  }
+  await bleCharacteristic.writeValue(chunk);
+}
+
+async function printViaBluetooth(bill){
+  if(!bleCharacteristic){
+    const reconnected = await attemptAutoReconnectBle();
+    if(!reconnected){
+      toast('No Bluetooth printer connected. Tap "Try Direct Bluetooth Connect" in Settings first.');
+      return false;
+    }
+  }
+  try{
+    const data = escposBytesForBill(bill);
+    const chunkSize = 20; // safest size across BLE modules with low default MTU
+    for(let i=0;i<data.length;i+=chunkSize){
+      await bleWriteChunk(data.slice(i, i+chunkSize));
+      await new Promise(r=>setTimeout(r, 25));
+    }
+    toast('Sent to Bluetooth printer ✅');
+    return true;
+  }catch(e){
+    toast('Bluetooth print failed (' + (e.message||'unknown error') + '). Try the RawBT method instead.');
+    return false;
+  }
+}
+
+function testPrint(){
+  const dummy = {
+    id: 0, billNo: 0, date: new Date().toISOString(),
+    dateDisplay: new Date().toLocaleDateString('en-GB'),
+    timeDisplay: new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}),
+    customer: 'Test Customer', customerPhone: '',
+    items: [{name:'Sample Item', qty:1, price:10, amount:10}],
+    total: 10, remarks: 'This is a test print.'
+  };
+  printBill(dummy);
+}
+
 async function printBill(bill){
+  if(getBleDirectPrintEnabled()){
+    if(!bleCharacteristic){
+      await attemptAutoReconnectBle();
+    }
+    if(!bleCharacteristic){
+      await connectBluetoothPrinter();
+    }
+    if(bleCharacteristic){
+      const ok = await printViaBluetooth(bill);
+      if(ok) return;
+    }
+    // fall through to the normal system print dialog if direct BLE printing failed
+  }
   applyPageSize();
   let qrDataUrl = '';
   if(getUpiEnabled() && getUpiId().trim()){
@@ -3950,18 +4199,39 @@ function normalizePhone(raw){
   return p;
 }
 
+const TELUGU_MONTHS = ['జనవరి','ఫిబ్రవరి','మార్చి','ఏప్రిల్','మే','జూన్','జూలై','ఆగస్టు','సెప్టెంబర్','అక్టోబర్','నవంబర్','డిసెంబర్'];
+function formatTeluguDate(isoDateStr){
+  const d = new Date(isoDateStr);
+  return d.getDate() + ', ' + TELUGU_MONTHS[d.getMonth()] + ' ' + d.getFullYear();
+}
+
 async function sendWhatsApp(id){
   const bill = getBills().find(b=>b.id===id);
   if(!bill){ toast('Bill not found.'); return; }
 
   await downloadPdf(id);
 
-  const msg = 'Hi '+bill.customer+', thank you for shopping at New Fancy Store!\n'
-    + 'Bill No: #'+String(bill.billNo).padStart(4,'0')+'   Date: '+bill.dateDisplay+'\n'
-    + 'Total: Rs. '+bill.total.toFixed(2)+'\n'
-    + (bill.remarks ? ('Note: '+bill.remarks+'\n') : '')
-    + '\n(Your bill PDF has just been downloaded on this device — please attach it here before sending.)\n'
-    + '- New Fancy Store, Chittoor';
+  const sep = '━━━━━━━━━━━━━━━';
+  let itemLines = '';
+  bill.items.forEach((it, idx)=>{
+    itemLines += (idx+1)+'. '+it.name+'\n   '+it.qty+' x ₹'+it.price.toFixed(2)+' = ₹'+it.amount.toFixed(2)+'\n';
+  });
+
+  const msg = '🏪 *New Fancy Store*\n'
+    + sep + '\n'
+    + '🧾 Invoice: *INV'+String(bill.billNo).padStart(4,'0')+'*\n'
+    + '📅 Date: ' + formatTeluguDate(bill.date) + '\n'
+    + '👤 Customer: ' + bill.customer + '\n'
+    + sep + '\n'
+    + itemLines
+    + sep + '\n'
+    + (bill.remarks ? ('📝 Note: '+bill.remarks+'\n'+sep+'\n') : '')
+    + '💰 *Total: ₹'+bill.total.toFixed(2)+'*\n\n'
+    + 'Thank you for shopping with us! 🙏\n'
+    + sep + '\n'
+    + '🏪 New Fancy Store\n'
+    + '📍 49, Kothapallimitta, S.R.Puram (Md), Chittoor - 517167\n'
+    + '📞 9866086614';
 
   const phone = normalizePhone(bill.customerPhone);
   const url = phone
@@ -3989,6 +4259,24 @@ function renderSettings(){
   document.getElementById('upiEnabled').checked = getUpiEnabled();
   document.getElementById('upiId').value = getUpiId();
   document.getElementById('upiName').value = getUpiName();
+  document.getElementById('bleNameFilter').value = getBleNameFilter();
+
+  if(bleCharacteristic && bleDevice){
+    document.getElementById('bleDirectPrintRow').style.display = '';
+  } else {
+    document.getElementById('bleDirectPrintRow').style.display = 'none';
+  }
+  updateBleStatusUI();
+  document.getElementById('bleDirectPrintToggle').checked = getBleDirectPrintEnabled();
+
+  const noteEl = document.getElementById('bleAutoReconnectNote');
+  if(!navigator.bluetooth){
+    noteEl.textContent = '';
+  } else if(navigator.bluetooth.getDevices){
+    noteEl.textContent = '✅ Auto-reconnect is supported on this device — once connected, the printer will try to reconnect by itself every time you open the app.';
+  } else {
+    noteEl.textContent = '⚠️ Your phone\'s Chrome version doesn\'t support automatic reconnect. You\'ll need to tap "Try Direct Bluetooth Connect" once each time you reopen the app — this is a phone/browser limitation, not an app setting.';
+  }
 }
 
 function saveUpiSettings(){
@@ -4099,6 +4387,7 @@ window.addEventListener('load', ()=>{
   resetForm(true);
   refreshProductList();
   setTimeout(checkAutoBackupRobust, 600);
+  setTimeout(attemptAutoReconnectBle, 800);
 });
 </script>
 <script>
