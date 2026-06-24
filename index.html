@@ -310,7 +310,8 @@
         </div>
         <div style="flex:1;">
           <label>Customer Phone (for WhatsApp)</label>
-          <input id="custPhone" type="tel" placeholder="10-digit number" autocomplete="off">
+          <input id="custPhone" type="tel" placeholder="10-digit number" autocomplete="off"
+              oninput="showCustSuggestionsByPhone(this)" onfocus="showCustSuggestionsByPhone(this)" onblur="setTimeout(hideSuggestions, 150)">
         </div>
       </div>
     </div>
@@ -363,19 +364,15 @@
           <label>Product Name</label>
           <input id="newProdName" placeholder="e.g. Hair Oil 100ml">
         </div>
-        <div>
-          <label>Price ₹</label>
-          <input id="newProdPrice" type="number" min="0" step="0.01" placeholder="0.00">
-        </div>
       </div>
       <button class="btn btn-add" onclick="addOrUpdateProduct()">+ Save Product</button>
-      <div class="hint">Add a product once here, with its price. While billing, just start typing the name in the Items table and it will appear in the suggestions.</div>
+      <div class="hint">Add a product name once here. While billing, just start typing the name in the Items table and it will appear in the suggestions — price is always entered fresh on each bill, never auto-filled.</div>
     </div>
 
     <div class="card">
       <input class="search-box" id="searchProd" placeholder="Search saved products..." oninput="renderProducts()">
       <table>
-        <thead><tr><th>Product Name</th><th class="num">Price ₹</th><th></th></tr></thead>
+        <thead><tr><th>Product Name</th><th></th></tr></thead>
         <tbody id="prodBody"></tbody>
       </table>
       <div id="prodEmpty" class="hint"></div>
@@ -3127,16 +3124,6 @@ function addItemRow(focusName){
 
 function onProductNameInput(input){
   showSuggestions(input);
-  const products = getProducts();
-  const name = input.value.trim();
-  if(products[name] !== undefined){
-    const tr = input.closest('tr');
-    const priceInput = tr.querySelector('.p-price');
-    if(!priceInput.value){
-      priceInput.value = products[name];
-      recalcRow(priceInput);
-    }
-  }
 }
 
 /* ---------------- live product suggestion dropdown ---------------- */
@@ -3165,10 +3152,10 @@ function showSuggestions(input){
   matches.forEach(name=>{
     const item = document.createElement('div');
     item.className = 'suggest-item';
-    item.innerHTML = `<span>${escapeHtml(name)}</span><span class="sp-price">₹${Number(products[name]).toFixed(2)}</span>`;
+    item.innerHTML = `<span>${escapeHtml(name)}</span>`;
     item.onmousedown = (e)=>{
       e.preventDefault();
-      selectSuggestion(input, name, products[name]);
+      selectSuggestion(input, name);
     };
     box.appendChild(item);
   });
@@ -3183,14 +3170,11 @@ function hideSuggestions(){
   if(suggestBox) suggestBox.style.display = 'none';
 }
 
-function selectSuggestion(input, name, price){
+function selectSuggestion(input, name){
   input.value = name;
   const tr = input.closest('tr');
-  const priceInput = tr.querySelector('.p-price');
-  priceInput.value = price;
-  recalcRow(priceInput);
   hideSuggestions();
-  tr.querySelector('.p-qty').focus();
+  tr.querySelector('.p-price').focus();
 }
 
 function showCustSuggestions(input){
@@ -3225,6 +3209,38 @@ function showCustSuggestions(input){
   box.style.display = 'block';
 }
 
+function showCustSuggestionsByPhone(input){
+  const query = input.value.trim();
+  if(!query){ hideSuggestions(); return; }
+  const customers = getCustomers();
+  const matches = Object.keys(customers)
+    .filter(name => (customers[name].phone || '').includes(query))
+    .sort((a,b)=>a.localeCompare(b))
+    .slice(0, 8);
+  if(matches.length === 0){ hideSuggestions(); return; }
+  const box = ensureSuggestBox();
+  box.innerHTML = '';
+  matches.forEach(name=>{
+    const item = document.createElement('div');
+    item.className = 'suggest-item';
+    const phone = customers[name].phone || '';
+    item.innerHTML = `<span>${escapeHtml(name)}</span><span class="sp-price">${escapeHtml(phone)}</span>`;
+    item.onmousedown = (e)=>{
+      e.preventDefault();
+      input.value = phone;
+      const nameField = document.getElementById('custName');
+      if(nameField) nameField.value = name;
+      hideSuggestions();
+    };
+    box.appendChild(item);
+  });
+  const rect = input.getBoundingClientRect();
+  box.style.left = (rect.left + window.scrollX) + 'px';
+  box.style.top = (rect.bottom + window.scrollY) + 'px';
+  box.style.width = rect.width + 'px';
+  box.style.display = 'block';
+}
+
 function priceKeyDown(e, input){
   if(e.key === 'Enter'){
     e.preventDefault();
@@ -3235,25 +3251,14 @@ function priceKeyDown(e, input){
 /* ---------------- products master list ---------------- */
 function addOrUpdateProduct(){
   const name = document.getElementById('newProdName').value.trim();
-  const price = parseFloat(document.getElementById('newProdPrice').value);
   if(!name){ toast('Please enter a product name.'); return; }
-  if(isNaN(price) || price < 0){ toast('Please enter a valid price.'); return; }
   const products = getProducts();
-  products[name] = price;
+  products[name] = true;
   saveProducts(products);
   document.getElementById('newProdName').value = '';
-  document.getElementById('newProdPrice').value = '';
   refreshProductList();
   renderProducts();
   toast('Product "'+name+'" saved.');
-}
-
-function editProduct(name){
-  const products = getProducts();
-  if(products[name] === undefined) return;
-  document.getElementById('newProdName').value = name;
-  document.getElementById('newProdPrice').value = products[name];
-  document.getElementById('newProdName').scrollIntoView({behavior:'smooth', block:'center'});
 }
 
 function deleteProduct(name){
@@ -3281,12 +3286,8 @@ function renderProducts(){
     const safeName = encodeURIComponent(name);
     tr.innerHTML = `
       <td>${escapeHtml(name)}</td>
-      <td class="num">${Number(products[name]).toFixed(2)}</td>
       <td>
-        <div class="action-btns">
-          <button class="btn btn-outline" style="padding:6px 10px;font-size:14px;" onclick="editProduct(decodeURIComponent('${safeName}'))">Edit</button>
-          <button class="btn" style="padding:6px 10px;font-size:14px;background:var(--red);color:#fff;" onclick="deleteProduct(decodeURIComponent('${safeName}'))">Delete</button>
-        </div>
+        <button class="btn" style="padding:6px 10px;font-size:14px;background:var(--red);color:#fff;" onclick="deleteProduct(decodeURIComponent('${safeName}'))">Delete</button>
       </td>
     `;
     body.appendChild(tr);
@@ -3645,7 +3646,7 @@ function finalizeBill(doPrint){
   }
 
   const products = getProducts();
-  items.forEach(it=>{ products[it.name] = it.price; });
+  items.forEach(it=>{ products[it.name] = true; });
   saveProducts(products);
 
   if(document.getElementById('custName').value.trim()){
